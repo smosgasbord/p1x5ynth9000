@@ -1,0 +1,389 @@
+<!-- App.svelte -->
+<script>
+  import { onMount } from 'svelte';
+  import * as Tone from 'tone';
+
+  let canvas;
+  let ctx;
+  let imageData;
+  let cursorPosition = 0;
+  let isPlaying = false;
+  //let direction = 1; // 1 for left to right, -1 for right to left
+  let volume = 0.5; // add this line
+  let lastPlayTime = 0;
+  const minTimeBetweenNotes = 0.1; // Minimum time between notes in seconds
+
+  let videoElement;
+  let mediaStream;
+
+  // Controls
+  let octave = 3;
+  let baseNote = 'G';
+  let cursorSpeed = 1;
+  let waveform = 'sine';
+  let scale = 'major';
+  let numberOfNotes = 2;
+  let inputSource = 'image';
+
+  // MIDI
+  let midiAccess;
+  let midiInputs = [];
+  let selectedMidiInput = null;
+
+  let synths = [];
+  let samplePoints = [];
+  let sustainEnabled = false; // add this line
+
+  const scales = {
+    major: [0, 2, 4, 5, 7, 9, 11, 12],
+    minor: [0, 2, 3, 5, 7, 8, 10, 12],
+    pentatonic: [0, 2, 4, 7, 9, 12],
+    chromatic: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  };
+
+  onMount(() => {
+    if (canvas) {
+      ctx = canvas.getContext('2d');
+      updateSynths();
+      
+      // Setup MIDI
+      if (navigator.requestMIDIAccess) {
+        navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
+      }
+    }
+  });
+
+  function updateSynths() {
+    // Dispose of existing synths
+    synths.forEach(synth => synth.dispose());
+    // Create new synths
+    synths = Array(numberOfNotes).fill().map(() => new Tone.PolySynth(Tone.Synth).toDestination());
+    //const osc = new Tone.Oscillator(110, waveform).toDestination();
+    // Update sample points
+    updateSamplePoints();
+  }
+
+  function updateSamplePoints() {
+    if (canvas && canvas.height) {
+      samplePoints = Array(numberOfNotes).fill().map((_, i) => 
+        Math.floor(i * (canvas.height - 1) / (numberOfNotes - 1))
+      );
+    }
+  }
+
+  function onMIDISuccess(access) {
+    midiAccess = access;
+    midiInputs = Array.from(midiAccess.inputs.values());
+    midiAccess.onstatechange = updateMIDIDevices;
+  }
+
+  function onMIDIFailure() {
+    console.log('Could not access your MIDI devices.');
+  }
+
+  function updateMIDIDevices(event) {
+    midiInputs = Array.from(midiAccess.inputs.values());
+  }
+
+  function handleMidiInputChange(event) {
+    if (selectedMidiInput) {
+      selectedMidiInput.onmidimessage = null;
+    }
+    selectedMidiInput = midiInputs.find(input => input.id === event.target.value);
+    if (selectedMidiInput) {
+      selectedMidiInput.onmidimessage = getMIDIMessage;
+    }
+  }
+
+  function getMIDIMessage(message) {
+    const [status, data1, data2] = message.data;
+    const command = status >> 4;
+    const channel = status & 0xf;
+
+    switch (command) {
+      case 9: // Note on
+        if (data2 > 0) {
+          console.log(data1)
+          // Use data1 (note number) to control base note
+          baseNote = Tone.Frequency(data1, "midi").toNote();
+          // Use data2 (velocity) to control volume
+          synths.forEach(synth => {
+            synth.volume.value = Tone.gainToDb(data2 / 127);
+          });
+        }
+        break;
+      case 11: // Control change
+        if (data1 === 1) { // Modulation wheel
+          // Use modulation wheel to control cursor speed
+          cursorSpeed = (data2 / 127) * 10;
+        } else if (data1 === 64) {
+          console.log(data1) // Sustain pedal
+        sustainEnabled = data2 > 0;
+      }
+
+        break;
+    }
+  }
+
+   async function loadImage(event) {
+    const file = event.target.files[0];
+    const reader = new FileReader();
+
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        if (canvas) {
+          canvas.width = Math.min(canvas.width, 600)
+          canvas.height = Math.min(canvas.height, 600)
+          //ctx.drawImage(img, 0, 0);
+           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          updateSamplePoints();
+        }
+      };
+      img.src = e.target.result;
+    };
+
+    reader.readAsDataURL(file);
+  }
+
+  async function startVideoInput(source) {
+    try {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+      }
+
+      if (source === 'webcam') {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      } else if (source === 'screen') {
+        mediaStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      }
+
+      videoElement.srcObject = mediaStream;
+      await videoElement.play();
+
+      if (canvas) {
+        canvas.width = videoElement.videoWidth;
+        canvas.height = videoElement.videoHeight;
+        updateSamplePoints();
+      }
+
+      updateCanvas();
+    } catch (error) {
+      console.error('Error accessing media devices:', error);
+    }
+  }
+
+  function updateCanvas() {
+    if (inputSource !== 'image' && canvas && ctx) {
+      ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+      imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    }
+    requestAnimationFrame(updateCanvas);
+  }
+
+  function togglePlay() {
+    isPlaying = !isPlaying;
+    if (isPlaying) {
+      Tone.start();
+      lastPlayTime = Tone.now();
+      requestAnimationFrame(scan);
+    }
+  }
+
+  function scan() {
+  if (!isPlaying || !canvas) return;
+
+  const x = Math.floor(cursorPosition);
+  const currentTime = Tone.now();
+
+  if (currentTime - lastPlayTime >= minTimeBetweenNotes) {
+    samplePoints.forEach((y, index) => {
+      const brightness = getBrightnessAtPoint(x, y);
+      const contrast = getContrastAroundPoint(x, y);
+
+      // Generate sound based on brightness and contrast
+      const baseFreq = Tone.Frequency(baseNote + octave).toFrequency();
+      const noteIndex = Math.floor(brightness * (scales[scale].length - 1));
+      const scaleStep = scales[scale][noteIndex] || 0;
+      const frequency = baseFreq * Math.pow(2, scaleStep / 12);
+      console.log(frequency)
+      console.log(scaleStep)
+      console.log(contrast)
+      console.log(brightness)
+      
+
+      // Use contrast to control the envelope
+      const attackTime = 0.005 + (1 - contrast) * 0.095; // 0.005 to 0.1
+      const releaseTime = 0.1 + contrast * 0.9; // 0.1 to 1
+
+      // Update synth parameters
+      synths[index].set({
+      volume: volume,
+        envelope: {
+          attack: attackTime,
+          release: releaseTime
+        },
+        oscillator: {
+          type: waveform
+        }
+      });
+
+      // Trigger the synth
+      if (sustainEnabled) {
+        synths[index].triggerAttack(frequency);
+      } else {
+        synths[index].triggerAttackRelease(frequency, '8n', currentTime);
+      }
+    });
+
+    lastPlayTime = currentTime;
+  }
+
+  // Move cursor
+  cursorPosition += cursorSpeed;
+  if (cursorPosition >= canvas.width) {
+    cursorPosition = 0;
+  }
+
+  // Draw cursor
+  ctx.putImageData(imageData, 0, 0);
+  ctx.fillStyle = 'red';
+  ctx.fillRect(x, 0, 2, canvas.height);
+
+  // Draw sample points
+  ctx.fillStyle = 'blue';
+  samplePoints.forEach(y => {
+    ctx.fillRect(x - 2, y - 2, 4, 4);
+  });
+
+  requestAnimationFrame(scan);
+}
+
+  function getBrightnessAtPoint(x, y) {
+    if (!imageData) return 0;
+    const index = (y * canvas.width + x) * 4;
+    const r = imageData.data[index];
+    const g = imageData.data[index + 1];
+    const b = imageData.data[index + 2];
+    return (r + g + b) / (3 * 255); // Normalize to 0-1
+  }
+
+  function getContrastAroundPoint(x, y) {
+    if (!imageData) return 0;
+    const radius = 5;
+    let min = 255;
+    let max = 0;
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const nx = Math.max(0, Math.min(canvas.width - 1, x + dx));
+        const ny = Math.max(0, Math.min(canvas.height - 1, y + dy));
+        const brightness = getBrightnessAtPoint(nx, ny) * 255;
+        min = Math.min(min, brightness);
+        max = Math.max(max, brightness);
+      }
+    }
+    return (max - min) / 255; // Normalize to 0-1
+  }
+
+  $: {
+    if (numberOfNotes) {
+      updateSynths();
+    }
+  }
+
+  $: {
+    if (canvas && canvas.height) {
+      updateSamplePoints();
+    }
+  }
+
+  $: if (inputSource === 'webcam' || inputSource === 'screen') {
+    startVideoInput(inputSource);
+  }
+</script>
+
+<main>
+  <canvas bind:this={canvas} width="600" height="600"></canvas>
+  <video bind:this={videoElement} style="display: none;"></video>
+  <div>
+    <select bind:value={inputSource}>
+      <option value="image">Image</option>
+      <option value="webcam">Webcam</option>
+      <option value="screen">Screen</option>
+    </select>
+    {#if inputSource === 'image'}
+      <input type="file" on:change={loadImage} accept="image/*" />
+    {/if}
+    <button on:click={togglePlay}>{isPlaying ? 'Pause' : 'Play'}</button>
+    <button on:click={() => cursorPosition = 0}>Rewind</button>
+    <button on:click={() => canvas && (cursorPosition = canvas.width - 1)}>Forward</button>
+  </div>
+  <div>
+    <label>
+      Octave:
+      <input type="number" bind:value={octave} min="0" max="8" />
+    </label>
+    <label>
+      Base Note:
+      <select bind:value={baseNote}>
+        {#each ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as note}
+          <option>{note}</option>
+        {/each}
+      </select>
+    </label>
+    <label>
+      Scale:
+      <select bind:value={scale}>
+        {#each Object.keys(scales) as scaleOption}
+          <option>{scaleOption}</option>
+        {/each}
+      </select>
+    </label>
+    <label>
+      Number of Notes:
+      <input type="number" bind:value={numberOfNotes} min="2" max="12" />
+    </label>
+    <label>
+      Cursor Speed:
+      <input type="range" bind:value={cursorSpeed} min="0.1" max="10" step="0.1" />
+    </label>
+     <label>
+      Volume:
+      <input type="range" bind:value={volume} min="0.1" max="20" step="0.1" />
+    </label>
+    <!--label>
+      Direction:
+      <select bind:value={direction}>
+        <option value={1}>Left to Right</option>
+        <option value={-1}>Right to Left</option>
+      </select>
+    </label-->
+    <label>
+      Waveform:
+      <select bind:value={waveform}>
+        <option>sine</option>
+        <option>square</option>
+        <option>sawtooth</option>
+        <option>triangle</option>
+      </select>
+    </label>
+    <label>
+      MIDI Input:
+      <select on:change={handleMidiInputChange}>
+        <option value="">Select MIDI Input</option>
+        {#each midiInputs as input}
+          <option value={input.id}>{input.name}</option>
+        {/each}
+      </select>
+    </label>
+  </div>
+</main>
+
+<style>
+  canvas {
+    border: 1px solid black;
+    max-width: 100%;
+    height: auto;
+  }
+</style>
